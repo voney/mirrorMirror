@@ -1,4 +1,5 @@
 #define FASTLED_ESP8266_NODEMCU
+#define FASTLED_ALLOW_INTERRUPTS 0
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -7,14 +8,18 @@
 #include <FastPatterns.h>
 #include <EasyTransfer.h>
 
-#define LED_PIN 1
-#define CLOCK_PIN 2
-#define STRIP_TYPE WS2812
+#define LED_PIN 6
+#define CLOCK_PIN 5
+#define STRIP_TYPE APA102
 #define STRIP_COLOUR RGB
-#define STRIP_LENGTH 20
+#define STRIP_LENGTH 72
 #define LED_UPDATE_FREQ 1000 										//How often to call the LED Update interrupt in Microseconds
 #define UDP_UPDATE_FREQ 30000										//How often to send a UDP pattern update in Milliseconds
 #define SLAVE_FUDGE 1												//Fudge factor to slow down the slave to match the master in Milliseconds
+#define BRIGHTNESS_BUTTON D1
+#define SPEED_BUTTON D2
+#define CYCLE_BUTTON D7
+
 
 const char* SSID = "MirrorMirror";
 const char* PSK = "OnTheWall";
@@ -25,14 +30,21 @@ bool master = false;
 int retries = 15; 													// x500ms to wait to connect to the wifi Master
 int selectedPattern = 0;
 
+uint8_t myBrightness = 255;
+
+int lastBrightnessBtnState = 0;
+int lastSpeedBtnState = 0;
+int lastCycleBtnState = 0;
+
 unsigned long currentMillis;
 unsigned long lastMilliUpdate;
-unsigned long lastUdpUpdate;
+unsigned long lastUdpUpdate; 
 
 struct SyncPacket {
 	uint8_t source;
 	uint8_t activePattern;
 	uint8_t userSpeed;
+	uint8_t myBrightness;
 	uint16_t index;
 	unsigned long lastUpdate;
 	unsigned long currentMillis;
@@ -57,6 +69,9 @@ void setup(void){
 	Serial.begin(115200);
 	Serial.println();
 	Serial.print("MirrorMirror starting...");
+	pinMode(BRIGHTNESS_BUTTON, INPUT);
+	pinMode(SPEED_BUTTON, INPUT);
+	pinMode(CYCLE_BUTTON, INPUT);
 	initWiFi();
 	initLEDs();
 	lastUdpUpdate = millis();
@@ -73,8 +88,10 @@ void loop(void){
 	} else {
 		delay(SLAVE_FUDGE);
 	}
-
 	handleUdpInput();
+	handleBrightnessButton();
+	handleSpeedButton();
+	handleCycleButton();
 }
 
 void initLEDs(){
@@ -89,8 +106,9 @@ void initLEDs(){
 	} else {
 		ledStrip.backwards = true;
 	}*/
-	//FastLED.addLeds<STRIP_TYPE, LED_PIN, CLOCK_PIN, STRIP_COLOUR>(ledStrip.ledArray, STRIP_LENGTH).setCorrection( TypicalLEDStrip );			// Use this one for 4 wire strips
-	FastLED.addLeds<STRIP_TYPE, LED_PIN, STRIP_COLOUR>(ledStrip.ledArray, STRIP_LENGTH).setCorrection( TypicalLEDStrip );						// Use this one for 3 wire strips
+	FastLED.addLeds<STRIP_TYPE, LED_PIN, CLOCK_PIN, STRIP_COLOUR>(ledStrip.ledArray, STRIP_LENGTH).setCorrection( TypicalLEDStrip );			// Use this one for 4 wire strips
+	//FastLED.addLeds<STRIP_TYPE, LED_PIN, STRIP_COLOUR>(ledStrip.ledArray, STRIP_LENGTH).setCorrection( TypicalLEDStrip );						// Use this one for 3 wire strips
+	FastLED.setBrightness(myBrightness);
 	ledStrip.SwitchPattern(0); 										// Initialise the Rainbow Cycle pattern.
 }
 
@@ -174,47 +192,53 @@ unsigned long timeSync(){
 void handleUdpInput(){
 	int numBytes = myUDP.parsePacket();
 	if (transfer.receiveData()) {
-		if (numBytes = 20){
+		if (!master){
 			currentMillis = statePacket.currentMillis;
-			Serial.print(millis() / 1000);
-			Serial.print(":Packet of ");
-			Serial.print(numBytes);
-			Serial.print(" received from ");
-			Serial.print(myUDP.remoteIP());
-			Serial.print(":");
-			Serial.println(myUDP.remotePort());
-			if (ledStrip.activePattern != statePacket.activePattern){
-				ledStrip.SwitchPattern(statePacket.activePattern);
+		}
+		Serial.print(millis() / 1000);
+		Serial.print(":Packet of ");
+		Serial.print(numBytes);
+		Serial.print(" received from ");
+		Serial.print(myUDP.remoteIP());
+		Serial.print(":");
+		Serial.println(myUDP.remotePort());
+		if (ledStrip.activePattern != statePacket.activePattern){
+			ledStrip.SwitchPattern(statePacket.activePattern);
+		}
+		ledStrip.userSpeed = statePacket.userSpeed;
+		ledStrip.colourA = statePacket.colourA;
+		ledStrip.colourB = statePacket.colourB;
+		myBrightness = statePacket.myBrightness;
+		FastLED.setBrightness(myBrightness);
+		if (ledStrip.backwards == statePacket.backwards) {
+			if (ledStrip.currentStep != statePacket.index){
+				Serial.println("Step mismatch with master.");
+				Serial.print("My step: ");
+				Serial.println(ledStrip.currentStep);
+				Serial.print("Masters step: ");
+				Serial.println(statePacket.index);
+				Serial.print("Setting my step to: ");
+				Serial.println(statePacket.index);
+				ledStrip.currentStep = statePacket.index;
+				ledStrip.lastUpdate = (currentMillis-(statePacket.currentMillis - statePacket.lastUpdate));
 			}
-			ledStrip.userSpeed = statePacket.userSpeed;
-			ledStrip.colourA = statePacket.colourA;
-			ledStrip.colourB = statePacket.colourB;
-			if (ledStrip.backwards == statePacket.backwards) {
-				if (ledStrip.currentStep != statePacket.index){
-					Serial.println("Step mismatch with master.");
-					Serial.print("My step: ");
-					Serial.println(ledStrip.currentStep);
-					Serial.print("Masters step: ");
-					Serial.println(statePacket.index);
-					Serial.print("Setting my step to: ");
-					Serial.println(statePacket.index);
-					ledStrip.currentStep = statePacket.index;
-					ledStrip.lastUpdate = (currentMillis-(statePacket.currentMillis - statePacket.lastUpdate));
-				}
 
-			} else {
-				if (ledStrip.currentStep != (ledStrip.totalSteps-(statePacket.index))){
-					Serial.println("Step mismatch with master.");
-					Serial.print("My step: ");
-					Serial.println(ledStrip.currentStep);
-					Serial.print("Masters step: ");
-					Serial.println(statePacket.index);
-					Serial.print("Setting my step to: ");
-					Serial.println(ledStrip.totalSteps-(statePacket.index));
-					ledStrip.currentStep = (ledStrip.totalSteps-(statePacket.index));
-					ledStrip.lastUpdate = (currentMillis-(statePacket.currentMillis - statePacket.lastUpdate));
-				}
+		} else {
+			if (ledStrip.currentStep != (ledStrip.totalSteps-(statePacket.index))){
+				Serial.println("Step mismatch with master.");
+				Serial.print("My step: ");
+				Serial.println(ledStrip.currentStep);
+				Serial.print("Masters step: ");
+				Serial.println(statePacket.index);
+				Serial.print("Setting my step to: ");
+				Serial.println(ledStrip.totalSteps-(statePacket.index));
+				ledStrip.currentStep = (ledStrip.totalSteps-(statePacket.index));
+				ledStrip.lastUpdate = (currentMillis-(statePacket.currentMillis - statePacket.lastUpdate));
 			}
+		}
+		if (master){
+			Serial.println("Update recieved from Slave.");
+			sendUdpUpdate(1);
 		}
 		
 	}
@@ -225,6 +249,7 @@ void sendUdpUpdate(int source){
 	statePacket.source = source;
 	statePacket.activePattern = ledStrip.activePattern;
 	statePacket.userSpeed = ledStrip.userSpeed;
+	statePacket.myBrightness = myBrightness;
 	statePacket.index = ledStrip.currentStep;
 	statePacket.lastUpdate = ledStrip.lastUpdate;
 	statePacket.currentMillis = millis();
@@ -257,4 +282,52 @@ void handleRoot(){
 		"<html><head><title>MirrorMirror Control</title><style>body {font-family: Sans-serif; text-align-last:center; text-align:center;}select,input {margin: auto; width: 100%; font-size: 16px; border: 1px solid #4F518C; height: 34px;}a.button {appearance: button;}</style></head><body><form action='/setpattern' method='post' enctype='application/x-www-form-urlencoded'><h4>Select Pattern</h4><select name='p'>%s</select></br></br><input type='submit' value='Submit' /></form><h4>Speed</h4><input TYPE='button' VALUE='Down' onclick=\"window.location.href='/setspeed?s=0'\"></br></br><input TYPE='button' VALUE='Up' onclick=\"window.location.href='/setspeed?s=1'\"></body></html>",
 		tempPattern.c_str());
 	httpServer.send(200, "text/html", tempHTML);
+}
+
+void handleBrightnessButton(){
+	int buttonState = digitalRead(BRIGHTNESS_BUTTON);
+	if (buttonState != lastBrightnessBtnState) {
+		if (buttonState == HIGH) {
+			Serial.println("Button Press: Brightness.");
+			myBrightness += 32;
+			FastLED.setBrightness(myBrightness);
+			sendUdpUpdate(3);
+			FastLED.delay(20);
+		}
+	}
+	lastBrightnessBtnState = buttonState;
+}
+
+void handleSpeedButton(){
+	int buttonState = digitalRead(SPEED_BUTTON);
+	if (buttonState != lastSpeedBtnState) {
+		if (buttonState == HIGH) {
+			Serial.println("Button Press: Speed.");
+			if (ledStrip.userSpeed < 10){
+				++ledStrip.userSpeed;
+			} else {
+				ledStrip.userSpeed = 1;
+			}
+			sendUdpUpdate(3);
+			FastLED.delay(20);
+		}
+	}
+	lastSpeedBtnState = buttonState;
+}
+
+void handleCycleButton(){
+	int buttonState = digitalRead(CYCLE_BUTTON);
+	if (buttonState != lastCycleBtnState) {
+		if (buttonState == HIGH) {
+			Serial.println("Button Press: Cycle Pattern.");
+			if (ledStrip.activePattern < (ledStrip.totalPatterns - 1) ){
+				ledStrip.SwitchPattern(ledStrip.activePattern+1);
+			} else {
+				ledStrip.SwitchPattern(0);
+			}
+			sendUdpUpdate(3);
+			FastLED.delay(20);
+		}
+	}
+	lastCycleBtnState = buttonState;
 }
